@@ -24,7 +24,7 @@ env:
   REGISTRY: quay.io
   # Override IMAGE_REPO by setting the repository secret QUAY_IMAGE_REPO
   # e.g. quay.io/openshift-pipelines/release-tests-ginkgo
-  IMAGE_REPO: ${{ vars.QUAY_IMAGE_REPO || 'quay.io/openshift-pipelines/release-tests-ginkgo' }}
+  IMAGE_REPO: ${{ vars.QUAY_IMAGE_REPO || 'quay.io/openshift-pipeline/release-tests-ginkgo' }}
 
 permissions:
   contents: read
