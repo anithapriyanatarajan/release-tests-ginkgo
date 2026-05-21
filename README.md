@@ -31,6 +31,8 @@ Key environment variables:
 | `GITLAB_TOKEN` | GitLab API token *(PAC tests)* |
 | `GITHUB_TOKEN` | GitHub token *(resolver tests)* |
 | `KO_DOCKER_REPO` | Registry for built test images |
+| `CHAINS_REPOSITORY` | OCI repo to push Kaniko-built images to *(Chains TC02)* |
+| `CHAINS_DOCKER_CONFIG_JSON` | Base64-encoded `docker/config.json` with push access to `CHAINS_REPOSITORY` *(Chains TC02)* |
 
 OLM subscription defaults (in `env/default/default.properties`):
 
@@ -190,6 +192,34 @@ LABEL_FILTER='triggers && sanity' ./scripts/run-tests.sh
 | Hub | `hub` | `tests/hub/` |
 | Metrics | `metrics` | `tests/metrics/` |
 | Versions | `versions` | `tests/versions/` |
+
+### Running the Chains suite
+
+The Chains suite has two test cases with different requirements:
+
+| Test case | What it tests | Extra env vars required |
+|-----------|---------------|------------------------|
+| `PIPELINES-27-TC01` | TaskRun signing — signature stored as annotation (`tekton` storage) | None |
+| `PIPELINES-27-TC02` | Image signing + attestation via Kaniko + Rekor | `CHAINS_REPOSITORY`, `CHAINS_DOCKER_CONFIG_JSON` |
+
+**TC01 only (no registry needed):**
+```bash
+export KUBECONFIG=/path/to/kubeconfig
+ginkgo run --label-filter='chains && sanity' --timeout=10m ./tests/chains/
+```
+
+**TC01 + TC02 (image signing, requires a registry):**
+```bash
+export KUBECONFIG=/path/to/kubeconfig
+export CHAINS_REPOSITORY=quay.io/<your-org>/chainstest   # repo to push signed images to
+export CHAINS_DOCKER_CONFIG_JSON=$(cat ~/.docker/config.json | base64 -w0)  # registry auth
+
+ginkgo run --label-filter=chains --timeout=30m ./tests/chains/
+```
+
+> `CHAINS_DOCKER_CONFIG_JSON` must be the **base64-encoded** contents of a `docker/config.json`
+> that has push access to `CHAINS_REPOSITORY`. The test creates a secret from this value and
+> links it to the `pipeline` service account in the test namespace.
 
 ## Project Layout
 
