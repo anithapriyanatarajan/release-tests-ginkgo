@@ -77,49 +77,62 @@ func RestoreTektonConfigChains() {
 	log.Println("Restored TektonConfig chains settings to defaults")
 }
 
+const (
+	chainsSignatureInterval = 10 * time.Second
+	chainsSignatureTimeout  = 3 * time.Minute
+)
+
 // VerifySignature verifies that a Tekton Chains signature exists for the given resource type.
+// It polls every 10 seconds for up to 3 minutes waiting for both the
+// chains.tekton.dev/signed and chains.tekton.dev/signature-<type>-<uid> annotations to be set.
 func VerifySignature(resourceType string) error {
 	ns := store.Namespace()
 	if ns == "" {
 		return fmt.Errorf("VerifySignature: store.Namespace() is empty - ensure hooks are configured")
 	}
-	// Get a signature of taskrun payload
+
+	// Get the UID of the last resource (created before polling starts).
 	resourceUID := cmd.MustSucceed("opc", resourceType, "describe", "--last", "-o", "jsonpath='{.metadata.uid}'", "-n", ns).Stdout()
 	resourceUID = strings.Trim(resourceUID, "'")
-	jsonpath := fmt.Sprintf("jsonpath=\"{.metadata.annotations.chains\\.tekton\\.dev/signature-%s-%s}\"", resourceType, resourceUID)
-	log.Println("Waiting 30 seconds")
-	cmd.MustSucceedIncreasedTimeout(time.Second*45, "sleep", "30")
-	signature := cmd.MustSucceed("opc", resourceType, "describe", "--last", "-o", jsonpath, "-n", ns).Stdout()
-	signature = strings.Trim(signature, "\"")
 
-	jsonpath = "jsonpath=\"{.metadata.annotations.chains\\.tekton\\.dev/signed}\""
-	isSigned := cmd.MustSucceed("opc", resourceType, "describe", "--last", "-o", jsonpath, "-n", ns).Stdout()
-	isSigned = strings.Trim(isSigned, "\"")
+	sigJSONPath := fmt.Sprintf("jsonpath=\"{.metadata.annotations.chains\\.tekton\\.dev/signature-%s-%s}\"", resourceType, resourceUID)
+	signedJSONPath := "jsonpath=\"{.metadata.annotations.chains\\.tekton\\.dev/signed}\""
 
-	if isSigned != "true" {
-		return fmt.Errorf("annotation chains.tekton.dev/signed is set to %s", isSigned)
+	log.Printf("Polling for Chains signature on %s (uid=%s), timeout=%s", resourceType, resourceUID, chainsSignatureTimeout)
+
+	var signature, isSigned string
+	ctx, cancel := context.WithTimeout(context.Background(), chainsSignatureTimeout)
+	defer cancel()
+
+	pollErr := wait.PollUntilContextTimeout(ctx, chainsSignatureInterval, chainsSignatureTimeout, true, func(context.Context) (bool, error) {
+		isSigned = strings.Trim(cmd.MustSucceed("opc", resourceType, "describe", "--last", "-o", signedJSONPath, "-n", ns).Stdout(), "\"")
+		signature = strings.Trim(cmd.MustSucceed("opc", resourceType, "describe", "--last", "-o", sigJSONPath, "-n", ns).Stdout(), "\"")
+
+		if isSigned == "true" && len(signature) > 0 {
+			return true, nil
+		}
+		log.Printf("  chains.tekton.dev/signed=%q, signature present=%v — retrying in %s", isSigned, len(signature) > 0, chainsSignatureInterval)
+		return false, nil
+	})
+	if pollErr != nil {
+		return fmt.Errorf("timed out waiting for Chains to sign %s (uid=%s): signed=%q, signature present=%v",
+			resourceType, resourceUID, isSigned, len(signature) > 0)
 	}
-	if len(signature) == 0 {
-		return fmt.Errorf("annotation chains.tekton.dev/signature-%s-%s is not set", resourceType, resourceUID)
-	}
 
-	// Decode the signature
+	// Decode the signature and verify with cosign.
 	decodedSignature, err := base64.StdEncoding.DecodeString(signature)
 	if err != nil {
-		return fmt.Errorf("error decoding base64: %w", err)
+		return fmt.Errorf("error decoding base64 signature: %w", err)
 	}
-	// Create file with signature
 	file, err := os.Create("sign")
 	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
+		return fmt.Errorf("error creating signature file: %w", err)
 	}
 	//nolint:errcheck
 	defer file.Close()
-	_, err = file.WriteString(string(decodedSignature))
-	if err != nil {
-		return fmt.Errorf("error writing to file: %w", err)
+	if _, err = file.WriteString(string(decodedSignature)); err != nil {
+		return fmt.Errorf("error writing signature file: %w", err)
 	}
-	// Verify signature with signing-secrets
 	cmd.MustSucceed("cosign", "verify-blob-attestation", "--insecure-ignore-tlog", "--key", publicKeyPath+"/cosign.pub", "--signature", "sign", "--type", "slsaprovenance", "--check-claims=false", "/dev/null")
 	return nil
 }
@@ -218,25 +231,70 @@ func CheckAttestationExists() error {
 	return nil
 }
 
-// CreateFileWithCosignPubKey creates a temporary file containing the cosign public key from the cluster secret.
+const (
+	signingSecretInterval     = 10 * time.Second
+	signingSecretTimeout      = 2 * time.Minute
+	signingSecretRetryTrigger = 3 // after this many empty polls, trigger key generation
+)
+
+// CreateFileWithCosignPubKey checks whether the Chains signing keypair already
+// exists in the "signing-secrets" secret (openshift-pipelines). If cosign.pub is
+// populated it is written to disk immediately. If after 3 polls it is still empty,
+// generateSigningSecret=true is patched into TektonConfig to trigger key generation,
+// and polling continues until the key appears or the 2-minute timeout is reached.
+//
+// Background: Chains uses the x509 signer by default. The keypair lives in
+// Secret "signing-secrets" (openshift-pipelines). It is normally created by the
+// OLM install suite via EnableChainsSigningSecret, but may not be present when
+// running the chains suite standalone against a pre-installed cluster.
 func CreateFileWithCosignPubKey() error {
-	chainsPublicKey := cmd.MustSucceed("oc", "get", "secrets", "signing-secrets", "-n", "openshift-pipelines", "-o", "jsonpath='{.data.cosign\\.pub}'").Stdout()
-	chainsPublicKey = strings.Trim(chainsPublicKey, "'")
-	decodedPublicKey, err := base64.StdEncoding.DecodeString(chainsPublicKey)
-	cmd.MustSucceed("mkdir", "-p", publicKeyPath)
-	if err != nil {
-		return fmt.Errorf("error decoding base64: %w", err)
+	log.Printf("Checking signing-secrets/cosign.pub (will trigger generation after %d empty polls)", signingSecretRetryTrigger)
+
+	var chainsPublicKey string
+	attempt := 0
+	triggered := false
+
+	ctx, cancel := context.WithTimeout(context.Background(), signingSecretTimeout)
+	defer cancel()
+
+	pollErr := wait.PollUntilContextTimeout(ctx, signingSecretInterval, signingSecretTimeout, true, func(context.Context) (bool, error) {
+		attempt++
+		raw := cmd.MustSucceed("oc", "get", "secrets", "signing-secrets", "-n", "openshift-pipelines",
+			"-o", "jsonpath='{.data.cosign\\.pub}'").Stdout()
+		raw = strings.Trim(raw, "'")
+		if len(raw) > 0 {
+			chainsPublicKey = raw
+			return true, nil
+		}
+		if attempt >= signingSecretRetryTrigger && !triggered {
+			log.Printf("  cosign.pub still empty after %d attempts — patching TektonConfig to trigger key generation", attempt)
+			patchData := `{"spec":{"chain":{"generateSigningSecret":true}}}`
+			cmd.MustSucceed("oc", "patch", "tektonconfig", "config", "-p", patchData, "--type=merge")
+			triggered = true
+		}
+		log.Printf("  signing-secrets/cosign.pub not populated yet (attempt %d) — retrying in %s", attempt, signingSecretInterval)
+		return false, nil
+	})
+	if pollErr != nil {
+		return fmt.Errorf("timed out waiting for signing-secrets/cosign.pub after %d attempts (generateSigningSecret triggered=%v): %w",
+			attempt, triggered, pollErr)
 	}
+
+	decodedPublicKey, err := base64.StdEncoding.DecodeString(chainsPublicKey)
+	if err != nil {
+		return fmt.Errorf("error decoding cosign.pub from base64: %w", err)
+	}
+	cmd.MustSucceed("mkdir", "-p", publicKeyPath)
 	fullPath := filepath.Join(publicKeyPath, "cosign.pub")
 	file, err := os.Create(filepath.Clean(fullPath))
 	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
+		return fmt.Errorf("error creating cosign.pub file: %w", err)
 	}
 	//nolint:errcheck
 	defer file.Close()
-	_, err = file.WriteString(string(decodedPublicKey))
-	if err != nil {
-		return fmt.Errorf("error writing to file: %w", err)
+	if _, err = file.WriteString(string(decodedPublicKey)); err != nil {
+		return fmt.Errorf("error writing cosign.pub file: %w", err)
 	}
+	log.Printf("cosign.pub written to %s", fullPath)
 	return nil
 }
