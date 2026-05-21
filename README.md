@@ -32,7 +32,7 @@ Key environment variables:
 | `GITHUB_TOKEN` | GitHub token *(resolver tests)* |
 | `KO_DOCKER_REPO` | Registry for built test images |
 | `CHAINS_REPOSITORY` | OCI repo to push Kaniko-built images to *(Chains TC02)* |
-| `CHAINS_DOCKER_CONFIG_JSON` | Base64-encoded `docker/config.json` with push access to `CHAINS_REPOSITORY` *(Chains TC02)* |
+| `CHAINS_DOCKER_CONFIG_JSON` | Raw JSON contents of `docker/config.json` with push access to `CHAINS_REPOSITORY` *(Chains TC02)* |
 
 OLM subscription defaults (in `env/default/default.properties`):
 
@@ -211,15 +211,16 @@ ginkgo run --label-filter='chains && sanity' --timeout=10m ./tests/chains/
 **TC01 + TC02 (image signing, requires a registry):**
 ```bash
 export KUBECONFIG=/path/to/kubeconfig
-export CHAINS_REPOSITORY=quay.io/<your-org>/chainstest   # repo to push signed images to
-export CHAINS_DOCKER_CONFIG_JSON=$(cat ~/.docker/config.json | base64 -w0)  # registry auth
+export CHAINS_REPOSITORY=quay.io/<your-org>/chainstest        # repo to push signed images to
+export CHAINS_DOCKER_CONFIG_JSON=$(cat ~/.docker/config.json) # raw JSON — do NOT base64-encode
 
 ginkgo run --label-filter=chains --timeout=30m ./tests/chains/
 ```
 
-> `CHAINS_DOCKER_CONFIG_JSON` must be the **base64-encoded** contents of a `docker/config.json`
-> that has push access to `CHAINS_REPOSITORY`. The test creates a secret from this value and
-> links it to the `pipeline` service account in the test namespace.
+> **`CHAINS_DOCKER_CONFIG_JSON`** must be the **raw JSON** contents of a `docker/config.json`
+> (i.e. the output of `cat ~/.docker/config.json`) that has push access to `CHAINS_REPOSITORY`.
+> Do **not** base64-encode it — the test passes it directly to `oc create secret` as
+> `--from-literal=.dockerconfigjson=<value>` which requires plain JSON.
 
 ## Project Layout
 
